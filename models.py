@@ -37,6 +37,7 @@ class RumorCase(Base):
     affected_regions = Column(JSON, default=list)
     debunk_status = Column(String(32), default="未辟谣")
     handle_status = Column(String(32), default="待处理")
+    handle_stage = Column(String(32), default="待处置")
     earliest_source_url = Column(String(512), nullable=True)
     earliest_source_platform = Column(String(128), nullable=True)
     earliest_source_author = Column(String(128), nullable=True)
@@ -80,6 +81,17 @@ class DuplicateAccount(Base):
     last_post_time = Column(DateTime, nullable=False)
 
     rumor_case = relationship("RumorCase", back_populates="duplicate_accounts")
+
+
+class TipFeedback(Base):
+    __tablename__ = "tip_feedbacks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    query_id = Column(Integer, ForeignKey("audit_queries.id"), nullable=False)
+    tip_type = Column(String(64), nullable=False)
+    feedback = Column(String(32), nullable=False)
+    submitter = Column(String(64), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class DebunkRecord(Base):

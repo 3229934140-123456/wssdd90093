@@ -91,8 +91,10 @@ class HighRiskRumor(BaseModel):
     affected_regions: List[str]
     debunk_status: str
     handle_status: str
+    handle_stage: str = "待处置"
     main_channels: List[str] = []
     recent_growth_rate: Optional[float] = None
+    suggested_action: Optional[str] = None
 
 
 class CategoryGroup(BaseModel):
@@ -137,4 +139,51 @@ class SpreadTrackResponse(BaseModel):
     trend: List[SpreadTrendItem]
     effect_evaluation: Optional[str] = None
     intervention_stats: Optional[InterventionStats] = None
-    observation_status: str = "充足"
+    observation_status: str = "待观察"
+
+
+class TipFeedbackCreate(BaseModel):
+    query_id: int
+    tip_type: str = Field(..., description="提示类型")
+    feedback: str = Field(..., pattern="^(准确|不准确|已采用)$", description="反馈类型")
+    submitter: str = Field(..., description="审核员账号")
+
+
+class TipFeedbackResponse(BaseModel):
+    id: int
+    query_id: int
+    tip_type: str
+    feedback: str
+    submitter: str
+    created_at: datetime
+
+
+class TipFeedbackSummary(BaseModel):
+    tip_type: str
+    total: int
+    accurate: int
+    inaccurate: int
+    adopted: int
+    adoption_rate: float = 0.0
+
+
+class DailyTrendItem(BaseModel):
+    date: str
+    high_risk_count: int
+    avg_risk_score: float
+    total_shares: int
+
+
+class CategoryTrendItem(BaseModel):
+    category: str
+    daily_trend: List[DailyTrendItem]
+    trend_direction: str = "平稳"
+    change_rate: Optional[float] = None
+
+
+class CrossDayComparisonResponse(BaseModel):
+    period_days: int
+    start_date: str
+    end_date: str
+    overall: List[DailyTrendItem]
+    by_category: List[CategoryTrendItem]
