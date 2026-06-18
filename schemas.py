@@ -187,3 +187,24 @@ class CrossDayComparisonResponse(BaseModel):
     end_date: str
     overall: List[DailyTrendItem]
     by_category: List[CategoryTrendItem]
+
+
+class StageSummaryItem(BaseModel):
+    stage: str
+    count: int
+    avg_reduction_rate: Optional[float] = None
+
+
+class CategoryStageItem(BaseModel):
+    category: str
+    count: int
+    avg_risk_score: float
+
+
+class HandleEffectSummary(BaseModel):
+    date: str
+    total_high_risk: int
+    by_stage: List[StageSummaryItem]
+    ineffective_by_category: List[CategoryStageItem]
+    overall_avg_reduction: Optional[float] = None
+    effective_rate: Optional[float] = None

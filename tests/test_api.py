@@ -551,3 +551,163 @@ class TestSpreadTrackSplit:
         if len(trend) > 0:
             if data["intervention_time"] is not None:
                 assert len(post_items) > 0 or len(pre_items) > 0
+
+
+class TestStageFilterConsistency:
+    def test_daily_list_filter_by_stage(self, client):
+        for i in range(3):
+            payload = {
+                "text_content": f"每日列表阶段筛选{i} 病毒疫情",
+                "ticket_id": f"TICKET-DAILY-STAGE-FLT-{i}",
+                "submitter": "auditor_01"
+            }
+            client.post("/api/v1/audit/analyze", json=payload)
+
+        response = client.get("/api/v1/supervisor/daily-high-risk?handle_stage=待处置&min_risk_score=0")
+        assert response.status_code == 200
+        data = response.json()
+        for r in data["rumors"]:
+            assert r["handle_stage"] == "待处置"
+
+    def test_export_filter_by_stage(self, client):
+        for i in range(3):
+            payload = {
+                "text_content": f"导出阶段筛选{i} 病毒疫情",
+                "ticket_id": f"TICKET-EXPORT-STAGE-FLT-{i}",
+                "submitter": "auditor_01"
+            }
+            client.post("/api/v1/audit/analyze", json=payload)
+
+        response = client.get("/api/v1/supervisor/daily-high-risk/export?format=json&handle_stage=待处置&min_risk_score=0")
+        assert response.status_code == 200
+        data = response.json()
+        all_rumors = []
+        for group in data.get("groups", []):
+            all_rumors.extend(group["rumors"])
+        for r in all_rumors:
+            assert r["handle_stage"] == "待处置"
+
+    def test_three_entries_same_stage_count(self, client):
+        for i in range(5):
+            payload = {
+                "text_content": f"三入口一致性{i} 病毒疫情",
+                "ticket_id": f"TICKET-3ENTRY-CONSIST-{i}",
+                "submitter": "auditor_01"
+            }
+            client.post("/api/v1/audit/analyze", json=payload)
+
+        list_resp = client.get("/api/v1/supervisor/daily-high-risk?handle_stage=待处置&min_risk_score=0")
+        list_count = list_resp.json()["total_high_risk"]
+
+        grouped_resp = client.get("/api/v1/supervisor/daily-high-risk/grouped?handle_stage=待处置&min_risk_score=0")
+        grouped_count = grouped_resp.json()["total_high_risk"]
+
+        export_resp = client.get("/api/v1/supervisor/daily-high-risk/export?format=json&handle_stage=待处置&min_risk_score=0")
+        export_count = export_resp.json()["total_high_risk"]
+
+        assert list_count == grouped_count == export_count
+
+
+class TestCrossDayFullDates:
+    def test_category_trend_has_all_days(self, client):
+        response = client.get("/api/v1/supervisor/cross-day-comparison?days=7&min_risk_score=0")
+        assert response.status_code == 200
+        data = response.json()
+
+        for cat_trend in data["by_category"]:
+            assert len(cat_trend["daily_trend"]) == 7
+            for item in cat_trend["daily_trend"]:
+                assert "date" in item
+                assert "high_risk_count" in item
+                assert "avg_risk_score" in item
+                assert "total_shares" in item
+
+    def test_empty_category_shows_zero(self, client):
+        response = client.get("/api/v1/supervisor/cross-day-comparison?days=7&min_risk_score=0")
+        data = response.json()
+
+        has_other_cat = any(c["category"] == "其他" for c in data["by_category"])
+        if not has_other_cat:
+            other_cat = [c for c in data["by_category"] if c["category"] == "其他"]
+            if other_cat:
+                for item in other_cat[0]["daily_trend"]:
+                    assert item["high_risk_count"] == 0
+                    assert item["total_shares"] == 0
+
+
+class TestExportWithFeedback:
+    def test_export_includes_feedback_summary(self, client):
+        payload = {
+            "text_content": "导出反馈测试 病毒疫情",
+            "ticket_id": "TICKET-EXPORT-FB-001",
+            "submitter": "auditor_01"
+        }
+        analyze_resp = client.post("/api/v1/audit/analyze", json=payload)
+        query_id = analyze_resp.json()["query_id"]
+
+        feedbacks = [
+            {"query_id": query_id, "tip_type": "duplicate_content", "feedback": "准确", "submitter": "auditor_01"},
+            {"query_id": query_id, "tip_type": "duplicate_content", "feedback": "已采用", "submitter": "auditor_01"},
+            {"query_id": query_id, "tip_type": "regional_spike", "feedback": "准确", "submitter": "auditor_02"},
+            {"query_id": query_id, "tip_type": "regional_spike", "feedback": "已采用", "submitter": "auditor_02"},
+            {"query_id": query_id, "tip_type": "regional_spike", "feedback": "已采用", "submitter": "auditor_03"},
+        ]
+        for fb in feedbacks:
+            client.post("/api/v1/supervisor/tips/feedback", json=fb)
+
+        response = client.get("/api/v1/supervisor/daily-high-risk/export?format=json&min_risk_score=0")
+        assert response.status_code == 200
+        data = response.json()
+
+        assert "tip_feedback_summary" in data
+        assert "top_adopted_tips" in data
+        assert len(data["top_adopted_tips"]) <= 3
+
+        if data["top_adopted_tips"]:
+            top = data["top_adopted_tips"][0]
+            assert "tip_type" in top
+            assert "adoption_rate" in top
+            assert "accurate_rate" in top
+            assert "inaccurate_rate" in top
+
+
+class TestHandleEffectSummary:
+    def test_handle_effect_summary_structure(self, client):
+        for i in range(3):
+            payload = {
+                "text_content": f"效果汇总测试{i} 病毒疫情",
+                "ticket_id": f"TICKET-EFFECT-SUM-{i}",
+                "submitter": "auditor_01"
+            }
+            client.post("/api/v1/audit/analyze", json=payload)
+
+        response = client.get("/api/v1/supervisor/handle-effect-summary?min_risk_score=0")
+        assert response.status_code == 200
+        data = response.json()
+
+        assert "date" in data
+        assert "total_high_risk" in data
+        assert "by_stage" in data
+        assert "ineffective_by_category" in data
+        assert "overall_avg_reduction" in data
+        assert "effective_rate" in data
+
+        assert len(data["by_stage"]) == 4
+        for stage_item in data["by_stage"]:
+            assert "stage" in stage_item
+            assert "count" in stage_item
+            assert "avg_reduction_rate" in stage_item or stage_item["avg_reduction_rate"] is None
+
+        stages = [s["stage"] for s in data["by_stage"]]
+        assert "待处置" in stages
+        assert "观察中" in stages
+        assert "已压降" in stages
+        assert "处置无效" in stages
+
+    def test_ineffective_by_category_sorted(self, client):
+        response = client.get("/api/v1/supervisor/handle-effect-summary?min_risk_score=0")
+        data = response.json()
+
+        if len(data["ineffective_by_category"]) > 1:
+            counts = [c["count"] for c in data["ineffective_by_category"]]
+            assert counts == sorted(counts, reverse=True)

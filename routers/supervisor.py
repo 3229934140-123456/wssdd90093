@@ -14,7 +14,8 @@ from schemas import (
     DailyHighRiskGroupedResponse, CategoryGroup,
     InterventionStats, TipFeedbackCreate, TipFeedbackResponse,
     TipFeedbackSummary, CrossDayComparisonResponse,
-    DailyTrendItem, CategoryTrendItem
+    DailyTrendItem, CategoryTrendItem,
+    HandleEffectSummary, StageSummaryItem, CategoryStageItem
 )
 from models import RumorCase, SpreadRecord, DuplicateAccount, TipFeedback
 from config import settings
@@ -130,31 +131,34 @@ def get_daily_high_risk(
     target_date: Optional[str] = None,
     category: Optional[str] = None,
     min_risk_score: int = Query(settings.HIGH_RISK_THRESHOLD, ge=0, le=100),
+    handle_stage: Optional[str] = Query(None, pattern="^(待处置|观察中|已压降|处置无效)$"),
     sort_by: str = Query("risk_score", pattern="^(risk_score|total_shares|last_active)$"),
     db: Session = Depends(get_db)
 ):
     date_obj = _parse_date(target_date)
     rumors = _get_daily_rumors(date_obj, min_risk_score, category, db)
 
-    by_category = defaultdict(int)
-    rumor_list = []
+    high_rumors = [_build_high_rumor(r) for r in rumors]
 
-    for r in rumors:
+    if handle_stage:
+        high_rumors = [r for r in high_rumors if r.handle_stage == handle_stage]
+
+    by_category = defaultdict(int)
+    for r in high_rumors:
         by_category[r.category] += 1
-        rumor_list.append(_build_high_rumor(r))
 
     if sort_by == "risk_score":
-        rumor_list.sort(key=lambda x: x.risk_score, reverse=True)
+        high_rumors.sort(key=lambda x: x.risk_score, reverse=True)
     elif sort_by == "total_shares":
-        rumor_list.sort(key=lambda x: x.total_shares, reverse=True)
+        high_rumors.sort(key=lambda x: x.total_shares, reverse=True)
     elif sort_by == "last_active":
-        rumor_list.sort(key=lambda x: x.last_active, reverse=True)
+        high_rumors.sort(key=lambda x: x.last_active, reverse=True)
 
     return DailyHighRiskResponse(
         date=date_obj.isoformat(),
-        total_high_risk=len(rumors),
+        total_high_risk=len(high_rumors),
         by_category=dict(by_category),
-        rumors=rumor_list
+        rumors=high_rumors
     )
 
 
@@ -467,13 +471,18 @@ def export_daily_high_risk(
     target_date: Optional[str] = None,
     format: str = Query("json", pattern="^(json|csv)$"),
     min_risk_score: int = Query(settings.HIGH_RISK_THRESHOLD, ge=0, le=100),
+    handle_stage: Optional[str] = Query(None, pattern="^(待处置|观察中|已压降|处置无效)$"),
     group_by_category: bool = True,
+    include_feedback_summary: bool = True,
     db: Session = Depends(get_db)
 ):
     date_obj = _parse_date(target_date)
     rumors = _get_daily_rumors(date_obj, min_risk_score, None, db)
 
     high_rumors = [_build_high_rumor(r) for r in rumors]
+
+    if handle_stage:
+        high_rumors = [r for r in high_rumors if r.handle_stage == handle_stage]
 
     def _rumor_to_dict(r: HighRiskRumor) -> dict:
         return {
@@ -498,6 +507,35 @@ def export_daily_high_risk(
         "export_time": datetime.now().isoformat(),
         "data": []
     }
+
+    if include_feedback_summary:
+        feedbacks = db.query(TipFeedback).all()
+        type_stats = defaultdict(lambda: {"total": 0, "准确": 0, "不准确": 0, "已采用": 0})
+        for f in feedbacks:
+            type_stats[f.tip_type]["total"] += 1
+            type_stats[f.tip_type][f.feedback] += 1
+
+        feedback_summary = []
+        for tip_type, stats in sorted(type_stats.items(), key=lambda x: x[1]["已采用"], reverse=True):
+            total = stats["total"]
+            adopted = stats["已采用"]
+            accurate = stats["准确"]
+            inaccurate = stats["不准确"]
+            adoption_rate = round(adopted / total * 100, 1) if total > 0 else 0
+            accurate_rate = round(accurate / total * 100, 1) if total > 0 else 0
+            inaccurate_rate = round(inaccurate / total * 100, 1) if total > 0 else 0
+            feedback_summary.append({
+                "tip_type": tip_type,
+                "total": total,
+                "adopted": adopted,
+                "adoption_rate": adoption_rate,
+                "accurate": accurate,
+                "accurate_rate": accurate_rate,
+                "inaccurate": inaccurate,
+                "inaccurate_rate": inaccurate_rate
+            })
+        export_data["tip_feedback_summary"] = feedback_summary
+        export_data["top_adopted_tips"] = feedback_summary[:3]
 
     if group_by_category:
         groups = defaultdict(list)
@@ -628,17 +666,32 @@ def cross_day_comparison(
                 total_shares=cat_shares
             ))
 
+    date_list = [(start_date + timedelta(days=i)).isoformat() for i in range(days)]
+
     category_trends = []
     for cat in settings.CATEGORIES:
-        if cat in category_data:
-            daily = category_data[cat]
-            trend_direction, change_rate = _compute_trend_direction(daily)
-            category_trends.append(CategoryTrendItem(
-                category=cat,
-                daily_trend=daily,
-                trend_direction=trend_direction,
-                change_rate=change_rate
-            ))
+        cat_daily = category_data.get(cat, [])
+        cat_by_date = {item.date: item for item in cat_daily}
+
+        full_daily = []
+        for d in date_list:
+            if d in cat_by_date:
+                full_daily.append(cat_by_date[d])
+            else:
+                full_daily.append(DailyTrendItem(
+                    date=d,
+                    high_risk_count=0,
+                    avg_risk_score=0.0,
+                    total_shares=0
+                ))
+
+        trend_direction, change_rate = _compute_trend_direction(full_daily)
+        category_trends.append(CategoryTrendItem(
+            category=cat,
+            daily_trend=full_daily,
+            trend_direction=trend_direction,
+            change_rate=change_rate
+        ))
 
     return CrossDayComparisonResponse(
         period_days=days,
@@ -660,7 +713,10 @@ def _compute_trend_direction(daily_items: List[DailyTrendItem]) -> tuple:
     second_avg = sum(d.high_risk_count for d in second_half) / len(second_half)
 
     if first_avg == 0:
-        return "上升" if second_avg > 0 else "平稳", None
+        if second_avg > 0:
+            return "明显升高", None
+        else:
+            return "平稳", None
 
     change_rate = round((second_avg - first_avg) / first_avg * 100, 1)
 
@@ -729,3 +785,93 @@ def get_tip_feedback_summary(db: Session = Depends(get_db)):
         ))
 
     return result
+
+
+def _calculate_reduction_rate(r: RumorCase) -> Optional[float]:
+    if not r.intervention_time or not r.spread_records:
+        return None
+
+    pre = [sr for sr in r.spread_records if sr.timestamp < r.intervention_time]
+    post = [sr for sr in r.spread_records if sr.timestamp >= r.intervention_time]
+
+    if not pre or not post:
+        return None
+
+    pre_days = len(set(sr.timestamp.date() for sr in pre))
+    post_days = len(set(sr.timestamp.date() for sr in post))
+
+    if pre_days == 0 or post_days == 0:
+        return None
+
+    pre_avg = sum(sr.share_count for sr in pre) / pre_days
+    post_avg = sum(sr.share_count for sr in post) / post_days
+
+    if pre_avg == 0:
+        return 0.0
+
+    return round((pre_avg - post_avg) / pre_avg * 100, 1)
+
+
+@router.get("/handle-effect-summary", response_model=HandleEffectSummary)
+def get_handle_effect_summary(
+    target_date: Optional[str] = None,
+    min_risk_score: int = Query(settings.HIGH_RISK_THRESHOLD, ge=0, le=100),
+    db: Session = Depends(get_db)
+):
+    date_obj = _parse_date(target_date)
+    rumors = _get_daily_rumors(date_obj, min_risk_score, None, db)
+
+    stage_stats: Dict[str, List[RumorCase]] = defaultdict(list)
+    for r in rumors:
+        stage = _compute_handle_stage(r)
+        stage_stats[stage].append(r)
+
+    by_stage = []
+    all_reductions = []
+    for stage in HANDLE_STAGES:
+        stage_rumors = stage_stats.get(stage, [])
+        reductions = []
+        for r in stage_rumors:
+            rate = _calculate_reduction_rate(r)
+            if rate is not None:
+                reductions.append(rate)
+                all_reductions.append(rate)
+
+        avg_reduction = round(sum(reductions) / len(reductions), 1) if reductions else None
+        by_stage.append(StageSummaryItem(
+            stage=stage,
+            count=len(stage_rumors),
+            avg_reduction_rate=avg_reduction
+        ))
+
+    ineffective_rumors = stage_stats.get("处置无效", [])
+    ineffective_by_cat: Dict[str, List[RumorCase]] = defaultdict(list)
+    for r in ineffective_rumors:
+        ineffective_by_cat[r.category].append(r)
+
+    ineffective_by_category = []
+    for cat in settings.CATEGORIES:
+        cat_rumors = ineffective_by_cat.get(cat, [])
+        if cat_rumors:
+            avg_score = round(sum(r.risk_score for r in cat_rumors) / len(cat_rumors), 1)
+            ineffective_by_category.append(CategoryStageItem(
+                category=cat,
+                count=len(cat_rumors),
+                avg_risk_score=avg_score
+            ))
+    ineffective_by_category.sort(key=lambda x: x.count, reverse=True)
+
+    overall_avg_reduction = round(sum(all_reductions) / len(all_reductions), 1) if all_reductions else None
+
+    effective_count = len(stage_stats.get("已压降", []))
+    closed_count = effective_count + len(stage_stats.get("处置无效", []))
+    effective_rate = round(effective_count / closed_count * 100, 1) if closed_count > 0 else None
+
+    return HandleEffectSummary(
+        date=date_obj.isoformat(),
+        total_high_risk=len(rumors),
+        by_stage=by_stage,
+        ineffective_by_category=ineffective_by_category,
+        overall_avg_reduction=overall_avg_reduction,
+        effective_rate=effective_rate
+    )
