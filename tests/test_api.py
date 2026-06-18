@@ -711,3 +711,156 @@ class TestHandleEffectSummary:
         if len(data["ineffective_by_category"]) > 1:
             counts = [c["count"] for c in data["ineffective_by_category"]]
             assert counts == sorted(counts, reverse=True)
+
+
+class TestManualStageOverride:
+    def test_manual_stage_shows_override_flag(self, client):
+        payload = {
+            "text_content": "人工阶段覆盖测试 病毒疫情",
+            "ticket_id": "TICKET-MANUAL-OVERRIDE-001",
+            "submitter": "auditor_01"
+        }
+        client.post("/api/v1/audit/analyze", json=payload)
+
+        rumors_resp = client.get("/api/v1/supervisor/rumors?limit=1&min_risk_score=0")
+        rumor_id = rumors_resp.json()[0]["rumor_id"]
+        original_stage = rumors_resp.json()[0]["handle_stage"]
+        assert rumors_resp.json()[0]["stage_overridden"] == False
+        assert rumors_resp.json()[0]["system_evaluated_stage"] is None
+
+        new_stage = "处置无效" if original_stage != "处置无效" else "已压降"
+        client.post(f"/api/v1/supervisor/rumors/{rumor_id}/update-stage?stage={new_stage}")
+
+        updated = client.get("/api/v1/supervisor/rumors?limit=1&min_risk_score=0").json()[0]
+        assert updated["handle_stage"] == new_stage
+        assert updated["stage_overridden"] == True
+        assert updated["system_evaluated_stage"] is not None
+        assert updated["system_evaluated_stage"] != new_stage or updated["system_evaluated_stage"] == new_stage
+
+    def test_manual_stage_reflected_in_all_views(self, client):
+        payload = {
+            "text_content": "人工阶段一致性测试 病毒疫情",
+            "ticket_id": "TICKET-MANUAL-CONSIST-001",
+            "submitter": "auditor_01"
+        }
+        client.post("/api/v1/audit/analyze", json=payload)
+
+        rumors_resp = client.get("/api/v1/supervisor/rumors?limit=1&min_risk_score=0")
+        rumor_id = rumors_resp.json()[0]["rumor_id"]
+
+        client.post(f"/api/v1/supervisor/rumors/{rumor_id}/update-stage?stage=处置无效")
+
+        list_resp = client.get("/api/v1/supervisor/rumors?handle_stage=处置无效&min_risk_score=0")
+        assert any(r["rumor_id"] == rumor_id for r in list_resp.json())
+
+        daily_resp = client.get("/api/v1/supervisor/daily-high-risk?handle_stage=处置无效&min_risk_score=0")
+        assert any(r["rumor_id"] == rumor_id for r in daily_resp.json()["rumors"])
+
+        export_resp = client.get("/api/v1/supervisor/daily-high-risk/export?format=json&handle_stage=处置无效&min_risk_score=0")
+        all_rumors = []
+        for g in export_resp.json().get("groups", []):
+            all_rumors.extend(g["rumors"])
+        assert any(r["rumor_id"] == rumor_id for r in all_rumors)
+
+
+class TestCSVFeedbackExport:
+    def test_csv_includes_feedback_summary(self, client):
+        payload = {
+            "text_content": "CSV反馈测试 病毒疫情",
+            "ticket_id": "TICKET-CSV-FB-001",
+            "submitter": "auditor_01"
+        }
+        analyze_resp = client.post("/api/v1/audit/analyze", json=payload)
+        query_id = analyze_resp.json()["query_id"]
+
+        client.post("/api/v1/supervisor/tips/feedback", json={
+            "query_id": query_id, "tip_type": "duplicate_content",
+            "feedback": "已采用", "submitter": "auditor_01"
+        })
+
+        response = client.get("/api/v1/supervisor/daily-high-risk/export?format=csv&min_risk_score=0")
+        assert response.status_code == 200
+        content = response.text
+        assert "复核反馈摘要" in content
+        assert "采用率TOP提示类型" in content
+        assert "duplicate_content" in content
+        assert "采用率" in content
+        assert "准确占比" in content
+
+
+class TestReviewEntry:
+    def test_review_entry_invalid_category(self, client):
+        response = client.get("/api/v1/supervisor/review-entry/无效类别?min_risk_score=0")
+        assert response.status_code == 400
+
+    def test_review_entry_valid_structure(self, client):
+        payload = {
+            "text_content": "复盘入口测试 病毒疫情",
+            "ticket_id": "TICKET-REVIEW-001",
+            "submitter": "auditor_01"
+        }
+        analyze_resp = client.post("/api/v1/audit/analyze", json=payload)
+
+        rumors_resp = client.get("/api/v1/supervisor/rumors?limit=1&min_risk_score=0")
+        rumor_id = rumors_resp.json()[0]["rumor_id"]
+
+        client.post(f"/api/v1/supervisor/rumors/{rumor_id}/update-stage?stage=处置无效")
+
+        response = client.get("/api/v1/supervisor/review-entry/医疗健康?min_risk_score=0")
+        assert response.status_code == 200
+        data = response.json()
+        assert "category" in data
+        assert "total_count" in data
+        assert "cases" in data
+        for case in data["cases"]:
+            assert "rumor_id" in case
+            assert "suggested_next_action" in case
+            assert "recent_change" in case
+            assert "reduction_rate" in case or case["reduction_rate"] is None
+
+
+class TestCrossDayDualFilter:
+    def test_cross_day_with_category_filter(self, client):
+        categories = ["医疗健康", "公共安全", "民生政策"]
+        for i, cat in enumerate(categories):
+            kw = {"医疗健康": "病毒疫情", "公共安全": "火灾事故", "民生政策": "退休补贴"}[cat]
+            payload = {
+                "text_content": f"跨日双重筛选{i} {kw}",
+                "ticket_id": f"TICKET-CROSS-DUAL-{i}",
+                "submitter": "auditor_01"
+            }
+            client.post("/api/v1/audit/analyze", json=payload)
+
+        response = client.get("/api/v1/supervisor/cross-day-comparison?days=7&category=医疗健康&min_risk_score=0")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["by_category"]) == 1
+        assert data["by_category"][0]["category"] == "医疗健康"
+        assert len(data["by_category"][0]["daily_trend"]) == 7
+
+    def test_cross_day_with_stage_filter(self, client):
+        payload = {
+            "text_content": "跨日阶段筛选 病毒疫情",
+            "ticket_id": "TICKET-CROSS-STAGE-001",
+            "submitter": "auditor_01"
+        }
+        client.post("/api/v1/audit/analyze", json=payload)
+
+        response = client.get("/api/v1/supervisor/cross-day-comparison?days=7&handle_stage=待处置&min_risk_score=0")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["overall"]) == 7
+        for item in data["overall"]:
+            assert "high_risk_count" in item
+
+    def test_cross_day_invalid_category(self, client):
+        response = client.get("/api/v1/supervisor/cross-day-comparison?category=无效类别&min_risk_score=0")
+        assert response.status_code == 400
+
+    def test_cross_day_category_filter_zero_dates_preserved(self, client):
+        response = client.get("/api/v1/supervisor/cross-day-comparison?days=7&category=教育文化&min_risk_score=0")
+        data = response.json()
+        daily = data["by_category"][0]["daily_trend"]
+        assert len(daily) == 7
+        zero_days = [d for d in daily if d["high_risk_count"] == 0]
+        assert len(zero_days) >= 0

@@ -92,6 +92,8 @@ class HighRiskRumor(BaseModel):
     debunk_status: str
     handle_status: str
     handle_stage: str = "待处置"
+    system_evaluated_stage: Optional[str] = None
+    stage_overridden: bool = False
     main_channels: List[str] = []
     recent_growth_rate: Optional[float] = None
     suggested_action: Optional[str] = None
@@ -208,3 +210,23 @@ class HandleEffectSummary(BaseModel):
     ineffective_by_category: List[CategoryStageItem]
     overall_avg_reduction: Optional[float] = None
     effective_rate: Optional[float] = None
+
+
+class ReviewCaseItem(BaseModel):
+    rumor_id: int
+    title: str
+    risk_level: str
+    risk_score: int
+    total_shares: int
+    reduction_rate: Optional[float] = None
+    recent_change: Optional[str] = None
+    intervention_time: Optional[datetime] = None
+    suggested_next_action: Optional[str] = None
+    main_channels: List[str] = []
+
+
+class ReviewEntryResponse(BaseModel):
+    category: str
+    total_count: int
+    avg_risk_score: float
+    cases: List[ReviewCaseItem]

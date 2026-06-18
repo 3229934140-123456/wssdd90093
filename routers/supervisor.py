@@ -15,7 +15,8 @@ from schemas import (
     InterventionStats, TipFeedbackCreate, TipFeedbackResponse,
     TipFeedbackSummary, CrossDayComparisonResponse,
     DailyTrendItem, CategoryTrendItem,
-    HandleEffectSummary, StageSummaryItem, CategoryStageItem
+    HandleEffectSummary, StageSummaryItem, CategoryStageItem,
+    ReviewEntryResponse, ReviewCaseItem
 )
 from models import RumorCase, SpreadRecord, DuplicateAccount, TipFeedback
 from config import settings
@@ -41,7 +42,10 @@ def _parse_date(target_date: Optional[str]) -> date:
     return date.today()
 
 
-def _compute_handle_stage(r: RumorCase) -> str:
+MANUAL_STAGES = ["已压降", "处置无效"]
+
+
+def _evaluate_system_stage(r: RumorCase) -> str:
     if not r.intervention_time:
         return "待处置"
 
@@ -78,6 +82,22 @@ def _compute_handle_stage(r: RumorCase) -> str:
     return "观察中"
 
 
+def _compute_handle_stage(r: RumorCase) -> str:
+    system_stage = _evaluate_system_stage(r)
+    manual_stage = getattr(r, "handle_stage", None)
+    if manual_stage in MANUAL_STAGES and manual_stage != system_stage:
+        return manual_stage
+    return system_stage
+
+
+def _get_stage_with_override(r: RumorCase) -> tuple:
+    system_stage = _evaluate_system_stage(r)
+    manual_stage = getattr(r, "handle_stage", None)
+    overridden = (manual_stage in MANUAL_STAGES) and (manual_stage != system_stage)
+    final_stage = manual_stage if overridden else system_stage
+    return final_stage, system_stage, overridden
+
+
 def _build_high_rumor(r: RumorCase) -> HighRiskRumor:
     channels = [c.get("channel_name", "") for c in (r.main_channels or [])]
     recent_growth = None
@@ -85,8 +105,8 @@ def _build_high_rumor(r: RumorCase) -> HighRiskRumor:
         growth_rates = [c.get("growth_rate", 0) for c in r.main_channels]
         recent_growth = max(growth_rates) if growth_rates else None
 
-    stage = _compute_handle_stage(r)
-    suggested_action = STAGE_SUGGESTED_ACTIONS.get(stage)
+    final_stage, system_stage, overridden = _get_stage_with_override(r)
+    suggested_action = STAGE_SUGGESTED_ACTIONS.get(final_stage)
 
     return HighRiskRumor(
         rumor_id=r.id,
@@ -100,7 +120,9 @@ def _build_high_rumor(r: RumorCase) -> HighRiskRumor:
         affected_regions=r.affected_regions or [],
         debunk_status=r.debunk_status,
         handle_status=r.handle_status,
-        handle_stage=stage,
+        handle_stage=final_stage,
+        system_evaluated_stage=system_stage if overridden else None,
+        stage_overridden=overridden,
         main_channels=channels,
         recent_growth_rate=recent_growth,
         suggested_action=suggested_action
@@ -607,6 +629,32 @@ def export_daily_high_risk(
                 r["last_active"]
             ])
 
+        if include_feedback_summary and export_data.get("tip_feedback_summary"):
+            writer.writerow([])
+            writer.writerow(["=== 复核反馈摘要 ==="])
+            writer.writerow(["提示类型", "总反馈数", "已采用数", "采用率", "准确数", "准确占比", "不准确数", "不准确占比"])
+            for item in export_data["tip_feedback_summary"]:
+                writer.writerow([
+                    item["tip_type"],
+                    item["total"],
+                    item["adopted"],
+                    f"{item['adoption_rate']}%",
+                    item["accurate"],
+                    f"{item['accurate_rate']}%",
+                    item["inaccurate"],
+                    f"{item['inaccurate_rate']}%"
+                ])
+            if export_data.get("top_adopted_tips"):
+                writer.writerow([])
+                writer.writerow(["=== 采用率TOP提示类型 ==="])
+                for i, item in enumerate(export_data["top_adopted_tips"], 1):
+                    writer.writerow([
+                        f"TOP{i}",
+                        item["tip_type"],
+                        f"采用率 {item['adoption_rate']}%",
+                        f"准确占比 {item['accurate_rate']}%"
+                    ])
+
         csv_content = output.getvalue()
         output.close()
 
@@ -621,8 +669,13 @@ def export_daily_high_risk(
 def cross_day_comparison(
     days: int = Query(7, ge=7, le=30),
     min_risk_score: int = Query(settings.HIGH_RISK_THRESHOLD, ge=0, le=100),
+    category: Optional[str] = None,
+    handle_stage: Optional[str] = Query(None, pattern="^(待处置|观察中|已压降|处置无效)$"),
     db: Session = Depends(get_db)
 ):
+    if category and category not in settings.CATEGORIES:
+        raise HTTPException(status_code=400, detail=f"无效的类别，有效值为: {settings.CATEGORIES}")
+
     end_date = date.today()
     start_date = end_date - timedelta(days=days - 1)
 
@@ -634,11 +687,18 @@ def cross_day_comparison(
         start_of_day = datetime.combine(current_date, datetime.min.time())
         end_of_day = datetime.combine(current_date + timedelta(days=1), datetime.min.time())
 
-        day_rumors = db.query(RumorCase).filter(
+        q = db.query(RumorCase).filter(
             RumorCase.risk_score >= min_risk_score,
             RumorCase.last_active >= start_of_day,
             RumorCase.last_active < end_of_day
-        ).all()
+        )
+        if category:
+            q = q.filter(RumorCase.category == category)
+
+        day_rumors = q.all()
+
+        if handle_stage:
+            day_rumors = [r for r in day_rumors if _compute_handle_stage(r) == handle_stage]
 
         high_risk_count = len(day_rumors)
         avg_score = sum(r.risk_score for r in day_rumors) / high_risk_count if high_risk_count > 0 else 0
@@ -652,7 +712,7 @@ def cross_day_comparison(
         )
         overall_trend.append(item)
 
-        cat_group = defaultdict(list)
+        cat_group: Dict[str, List[RumorCase]] = defaultdict(list)
         for r in day_rumors:
             cat_group[r.category].append(r)
 
@@ -668,8 +728,9 @@ def cross_day_comparison(
 
     date_list = [(start_date + timedelta(days=i)).isoformat() for i in range(days)]
 
+    target_categories = [category] if category else settings.CATEGORIES
     category_trends = []
-    for cat in settings.CATEGORIES:
+    for cat in target_categories:
         cat_daily = category_data.get(cat, [])
         cat_by_date = {item.date: item for item in cat_daily}
 
@@ -874,4 +935,78 @@ def get_handle_effect_summary(
         ineffective_by_category=ineffective_by_category,
         overall_avg_reduction=overall_avg_reduction,
         effective_rate=effective_rate
+    )
+
+
+NEXT_ACTIONS_BY_CATEGORY = {
+    "医疗健康": "建议联合卫健委核实权威信息，升级辟谣内容覆盖重点社群",
+    "公共安全": "建议协调公安宣传部门，联动地方政务号集中发声压制不实信息",
+    "民生政策": "建议联系政策发布单位补充说明原文，对重点转发账号点对点沟通",
+    "财经金融": "建议联动证监会或行业协会发布澄清公告，通知主要财经平台限流",
+    "教育文化": "建议联系教育主管部门说明情况，通过校园渠道定向推送辟谣",
+    "其他": "建议复核案例分类是否准确，根据实际传播渠道制定针对性处置方案"
+}
+
+
+@router.get("/review-entry/{category}", response_model=ReviewEntryResponse)
+def get_review_entry(
+    category: str,
+    target_date: Optional[str] = None,
+    min_risk_score: int = Query(settings.HIGH_RISK_THRESHOLD, ge=0, le=100),
+    db: Session = Depends(get_db)
+):
+    if category not in settings.CATEGORIES:
+        raise HTTPException(status_code=400, detail=f"无效的类别，有效值为: {settings.CATEGORIES}")
+
+    date_obj = _parse_date(target_date)
+    rumors = _get_daily_rumors(date_obj, min_risk_score, None, db)
+
+    ineffective_rumors = []
+    for r in rumors:
+        final_stage, _, _ = _get_stage_with_override(r)
+        if r.category == category and final_stage == "处置无效":
+            ineffective_rumors.append(r)
+
+    cases = []
+    for r in ineffective_rumors:
+        channels = [c.get("channel_name", "") for c in (r.main_channels or [])]
+        reduction = _calculate_reduction_rate(r)
+
+        if reduction is not None and reduction < 0:
+            recent_change = f"处置后传播量反而上升 {int(abs(reduction))}%"
+        elif reduction is not None:
+            recent_change = f"处置后仅下降 {int(reduction)}%"
+        else:
+            recent_change = "传播数据不足，无法量化变化"
+
+        base_action = NEXT_ACTIONS_BY_CATEGORY.get(category, NEXT_ACTIONS_BY_CATEGORY["其他"])
+        if reduction is not None and reduction < -10:
+            suggested_next_action = f"{base_action}；当前传播仍在扩散，建议 48 小时内完成复盘"
+        elif reduction is not None and reduction < 5:
+            suggested_next_action = f"{base_action}；处置效果不明显，建议本周内安排联合复盘"
+        else:
+            suggested_next_action = f"{base_action}；建议核查分类是否有误，重新评估处置策略"
+
+        cases.append(ReviewCaseItem(
+            rumor_id=r.id,
+            title=r.title,
+            risk_level=r.risk_level,
+            risk_score=r.risk_score,
+            total_shares=r.total_shares,
+            reduction_rate=reduction,
+            recent_change=recent_change,
+            intervention_time=r.intervention_time,
+            suggested_next_action=suggested_next_action,
+            main_channels=channels[:3]
+        ))
+
+    cases.sort(key=lambda c: c.risk_score, reverse=True)
+
+    avg_score = round(sum(c.risk_score for c in cases) / len(cases), 1) if cases else 0.0
+
+    return ReviewEntryResponse(
+        category=category,
+        total_count=len(cases),
+        avg_risk_score=avg_score,
+        cases=cases
     )
