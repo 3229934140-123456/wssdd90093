@@ -91,6 +91,14 @@ class HighRiskRumor(BaseModel):
     affected_regions: List[str]
     debunk_status: str
     handle_status: str
+    main_channels: List[str] = []
+    recent_growth_rate: Optional[float] = None
+
+
+class CategoryGroup(BaseModel):
+    category: str
+    count: int
+    rumors: List[HighRiskRumor]
 
 
 class DailyHighRiskResponse(BaseModel):
@@ -100,10 +108,26 @@ class DailyHighRiskResponse(BaseModel):
     rumors: List[HighRiskRumor]
 
 
+class DailyHighRiskGroupedResponse(BaseModel):
+    date: str
+    total_high_risk: int
+    by_category: Dict[str, int]
+    groups: List[CategoryGroup]
+    sort_by: str
+
+
 class SpreadTrendItem(BaseModel):
     timestamp: datetime
     share_count: int
     after_intervention: bool
+
+
+class InterventionStats(BaseModel):
+    pre_avg_daily: Optional[float] = None
+    post_new_shares: Optional[int] = None
+    reduction_rate: Optional[float] = None
+    pre_period_days: Optional[int] = None
+    post_period_days: Optional[int] = None
 
 
 class SpreadTrackResponse(BaseModel):
@@ -112,3 +136,5 @@ class SpreadTrackResponse(BaseModel):
     intervention_time: Optional[datetime] = None
     trend: List[SpreadTrendItem]
     effect_evaluation: Optional[str] = None
+    intervention_stats: Optional[InterventionStats] = None
+    observation_status: str = "充足"

@@ -47,7 +47,7 @@ def analyze_rumor(query: AuditQueryCreate, db: Session = Depends(get_db)):
 
     audit_query.status = "completed"
     audit_query.result = result.model_dump(mode='json')
-    audit_query.completed_at = datetime.utcnow()
+    audit_query.completed_at = datetime.now()
     audit_query.rumor_case_id = rumor_case.id
 
     db.commit()

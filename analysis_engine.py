@@ -53,14 +53,22 @@ class RumorAnalyzer:
         earliest_source = self._trace_earliest_source(text_content, topic_tags, content_url)
         main_channels = self._identify_diffusion_channels(text_content, topic_tags)
         risk_assessment = self._assess_risk(text_content, topic_tags, main_channels)
-        actionable_tips = self._generate_actionable_tips(main_channels, risk_assessment)
         debunk_info = self._check_debunk_info(text_content, topic_tags)
 
         similar_cases = self.db.query(RumorCase).filter(
             RumorCase.category == risk_assessment.category
         ).count()
 
-        now = datetime.utcnow()
+        now = datetime.now()
+
+        duplicate_count = self._calculate_duplicate_account_count(text_content, main_channels)
+
+        actionable_tips = self._generate_actionable_tips(
+            main_channels,
+            risk_assessment,
+            debunk_info,
+            duplicate_count
+        )
 
         rumor_case = RumorCase(
             title=self._extract_title(text_content, topic_tags),
@@ -87,7 +95,7 @@ class RumorAnalyzer:
         self.db.flush()
 
         self._generate_mock_spread_records(rumor_case.id, main_channels)
-        self._generate_mock_duplicate_accounts(rumor_case.id, text_content)
+        self._generate_mock_duplicate_accounts(rumor_case.id, duplicate_count)
 
         if debunk_info.exists:
             debunk_record = DebunkRecord(
@@ -114,6 +122,29 @@ class RumorAnalyzer:
 
         return result, rumor_case
 
+    def _calculate_duplicate_account_count(self, text_content: Optional[str],
+                                            channels: List[DiffusionChannel]) -> int:
+        total_shares = sum(c.share_count for c in channels)
+
+        if total_shares > 10000:
+            base = 30
+        elif total_shares > 5000:
+            base = 15
+        elif total_shares > 2000:
+            base = 8
+        elif total_shares > 500:
+            base = 4
+        elif total_shares > 100:
+            base = 2
+        else:
+            base = 1
+
+        rapid_channels = [c for c in channels if c.is_rapid_growth]
+        if len(rapid_channels) >= 2:
+            base += int(base * 0.5)
+
+        return max(1, base)
+
     def _trace_earliest_source(self, text_content: Optional[str],
                                topic_tags: Optional[List[str]],
                                content_url: Optional[str]) -> Optional[SourceInfo]:
@@ -125,7 +156,7 @@ class RumorAnalyzer:
             return SourceInfo(
                 source_url=content_url,
                 source_type=random.choice(source_types),
-                publish_time=datetime.utcnow() - timedelta(hours=random.randint(2, 168)),
+                publish_time=datetime.now() - timedelta(hours=random.randint(2, 168)),
                 author=f"用户{random.randint(1000, 9999)}",
                 platform=platform,
                 confidence=round(random.uniform(0.7, 0.95), 2)
@@ -134,7 +165,7 @@ class RumorAnalyzer:
         return SourceInfo(
             source_url=f"https://{random.choice(['weibo.com', 'www.zhihu.com', 'www.douyin.com'])}/status/{random.randint(100000, 999999)}",
             source_type=random.choice(source_types),
-            publish_time=datetime.utcnow() - timedelta(hours=random.randint(12, 336)),
+            publish_time=datetime.now() - timedelta(hours=random.randint(12, 336)),
             author=f"用户{random.randint(1000, 9999)}",
             platform=random.choice(platforms),
             confidence=round(random.uniform(0.6, 0.85), 2)
@@ -291,42 +322,69 @@ class RumorAnalyzer:
         return factors
 
     def _generate_actionable_tips(self, channels: List[DiffusionChannel],
-                                  risk: RiskAssessment) -> List[ActionableTip]:
+                                  risk: RiskAssessment,
+                                  debunk_info: DebunkInfo,
+                                  duplicate_count: int) -> List[ActionableTip]:
         tips = []
         total_shares = sum(c.share_count for c in channels)
 
-        if total_shares > 1000:
+        if duplicate_count >= 3:
+            severity = "warning" if duplicate_count < 10 else "danger"
             tips.append(ActionableTip(
                 tip_type="duplicate_content",
-                content=f"检测到 {random.randint(5, 50)} 个账号正在复用相同文案",
-                severity="warning" if total_shares < 5000 else "danger",
-                suggestion="建议批量标记相似内容，查看复用账号清单"
+                content=f"检测到 {duplicate_count} 个账号正在复用相同文案",
+                severity=severity,
+                suggestion=f"建议批量标记相似内容，目前共发现{duplicate_count}个账号在传播相同内容"
             ))
 
-        rapid_channels = [c for c in channels if c.is_rapid_growth and c.region]
-        for rc in rapid_channels[:1]:
+        rapid_with_region = [c for c in channels if c.is_rapid_growth and c.region]
+        if rapid_with_region:
+            rc = rapid_with_region[0]
+            growth_pct = int(rc.growth_rate * 100)
             tips.append(ActionableTip(
                 tip_type="regional_spike",
-                content=f"{rc.region}地区{rc.channel_name}转发量突然增多（24小时增长{int(rc.growth_rate * 100)}%）",
+                content=f"{rc.region}地区{rc.channel_name}转发量突然增多（24小时增长{growth_pct}%）",
                 severity="danger",
-                suggestion=f"建议重点监控{rc.region}地区相关群组，必要时协调当地资源"
+                suggestion=f"建议重点监控{rc.region}地区相关群组，必要时协调当地资源处置"
             ))
+
+        if len(channels) >= 2:
+            rapid_count = sum(1 for c in channels if c.is_rapid_growth)
+            if rapid_count >= 2:
+                channel_names = "、".join([c.channel_name for c in channels if c.is_rapid_growth][:2])
+                tips.append(ActionableTip(
+                    tip_type="multi_channel_spread",
+                    content=f"多渠道同时扩散，{channel_names}等{rapid_count}个渠道均在快速传播",
+                    severity="warning" if rapid_count == 2 else "danger",
+                    suggestion="建议跨渠道联动处置，同步通知各平台审核团队"
+                ))
 
         if risk.risk_level in ["高", "极高"]:
             tips.append(ActionableTip(
                 tip_type="high_risk",
                 content=f"当前风险等级为「{risk.risk_level}」，{risk.category}类内容",
                 severity="danger",
-                suggestion="建议立即升级处理，2小时内完成处置并记录"
+                suggestion=f"建议立即升级处理，{risk.risk_level}风险内容需在2小时内完成处置"
             ))
 
-        if random.random() > 0.5:
-            tips.append(ActionableTip(
-                tip_type="debunk_coverage",
-                content="权威辟谣已出现但覆盖不足，辟谣内容触达率仅约30%",
-                severity="warning",
-                suggestion="建议推送辟谣内容至相关用户，协调官方账号转发扩大覆盖"
-            ))
+        if debunk_info.exists:
+            coverage_pct = int((debunk_info.coverage_ratio or 0) * 100)
+            authority = debunk_info.debunk_authority or "权威机构"
+
+            if coverage_pct < 50:
+                tips.append(ActionableTip(
+                    tip_type="debunk_coverage",
+                    content=f"{authority}已发布辟谣，但覆盖不足（触达率约{coverage_pct}%）",
+                    severity="warning" if coverage_pct > 20 else "danger",
+                    suggestion="建议推送辟谣内容至相关用户，协调官方账号转发扩大覆盖范围"
+                ))
+            else:
+                tips.append(ActionableTip(
+                    tip_type="debunk_coverage",
+                    content=f"{authority}辟谣内容覆盖良好（触达率约{coverage_pct}%）",
+                    severity="info",
+                    suggestion="可继续监控传播趋势，辟谣内容持续发挥作用"
+                ))
 
         return tips
 
@@ -361,7 +419,7 @@ class RumorAnalyzer:
         return "未命名谣言"
 
     def _build_result_from_existing(self, case: RumorCase) -> AnalysisResult:
-        now = datetime.utcnow()
+        now = datetime.now()
 
         earliest_source = None
         if case.earliest_source_url:
@@ -383,21 +441,28 @@ class RumorAnalyzer:
             key_factors=["已有历史分析记录"]
         )
 
-        actionable_tips = [
-            ActionableTip(
-                tip_type="history",
-                content=f"该谣言已在系统中存在，此前已有 {len(case.audit_queries)} 次查询",
-                severity="info",
-                suggestion="查看历史处置记录，参考已有处理方案"
-            )
-        ]
-
         debunk_info = DebunkInfo(
             exists=case.debunk_url is not None,
             debunk_url=case.debunk_url,
             debunk_authority=case.debunk_authority,
             coverage_ratio=case.debunk_coverage
         )
+
+        duplicate_count = len(case.duplicate_accounts)
+        base_tips = self._generate_actionable_tips(
+            main_channels,
+            risk_assessment,
+            debunk_info,
+            duplicate_count
+        )
+
+        history_tip = ActionableTip(
+            tip_type="history",
+            content=f"该谣言已在系统中存在，此前已有 {len(case.audit_queries)} 次查询",
+            severity="info",
+            suggestion="查看历史处置记录，参考已有处理方案"
+        )
+        base_tips.insert(0, history_tip)
 
         similar_cases = self.db.query(RumorCase).filter(
             RumorCase.category == case.category,
@@ -408,14 +473,14 @@ class RumorAnalyzer:
             earliest_source=earliest_source,
             main_channels=main_channels,
             risk_assessment=risk_assessment,
-            actionable_tips=actionable_tips,
+            actionable_tips=base_tips,
             debunk_info=debunk_info,
             similar_cases_count=similar_cases,
             analyzed_at=now
         )
 
     def _generate_mock_spread_records(self, rumor_case_id: int, channels: List[DiffusionChannel]):
-        now = datetime.utcnow()
+        now = datetime.now()
         for i in range(14):
             timestamp = now - timedelta(days=13 - i)
             for channel in channels[:2]:
@@ -433,18 +498,18 @@ class RumorAnalyzer:
                 )
                 self.db.add(record)
 
-    def _generate_mock_duplicate_accounts(self, rumor_case_id: int, text_content: Optional[str]):
-        platforms = ["微博", "微信公众号", "抖音", "小红书"]
-        num_accounts = random.randint(3, 15)
+    def _generate_mock_duplicate_accounts(self, rumor_case_id: int, count: int):
+        platforms = ["微博", "微信公众号", "抖音", "小红书", "快手", "知乎"]
+        name_prefixes = ["正能量", "生活", "科普", "资讯", "健康", "本地"]
 
-        for _ in range(num_accounts):
-            now = datetime.utcnow()
+        for i in range(count):
+            now = datetime.now()
             account = DuplicateAccount(
                 rumor_case_id=rumor_case_id,
-                account_id=f"acc_{random.randint(100000, 999999)}",
-                account_name=f"{'正能量' if random.random() > 0.5 else '生活'}{random.randint(1, 999)}",
-                platform=random.choice(platforms),
-                post_count=random.randint(1, 10),
+                account_id=f"acc_{100000 + i}",
+                account_name=f"{random.choice(name_prefixes)}{random.randint(1, 999)}",
+                platform=platforms[i % len(platforms)],
+                post_count=max(1, count // 3 + random.randint(0, 3)),
                 first_post_time=now - timedelta(hours=random.randint(12, 168)),
                 last_post_time=now - timedelta(hours=random.randint(1, 48))
             )

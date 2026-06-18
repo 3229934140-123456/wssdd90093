@@ -112,7 +112,7 @@ class TestRumorAnalyzer:
     def test_generate_actionable_tips_high_risk(self, db_session):
         analyzer = RumorAnalyzer(db_session)
 
-        from schemas import DiffusionChannel, RiskAssessment
+        from schemas import DiffusionChannel, RiskAssessment, DebunkInfo
 
         channels = [
             DiffusionChannel(
@@ -131,11 +131,110 @@ class TestRumorAnalyzer:
             key_factors=["传播量大"]
         )
 
-        tips = analyzer._generate_actionable_tips(channels, risk)
+        debunk_info = DebunkInfo(exists=False)
+        duplicate_count = 8
+
+        tips = analyzer._generate_actionable_tips(channels, risk, debunk_info, duplicate_count)
 
         tip_types = [t.tip_type for t in tips]
         assert "duplicate_content" in tip_types
         assert "high_risk" in tip_types
+        assert "regional_spike" in tip_types
+
+    def test_actionable_tips_stable_with_data(self, db_session):
+        analyzer = RumorAnalyzer(db_session)
+
+        from schemas import DiffusionChannel, RiskAssessment, DebunkInfo
+
+        channels = [
+            DiffusionChannel(
+                channel_name="社交媒体群组",
+                share_count=500,
+                growth_rate=0.2,
+                region="上海",
+                is_rapid_growth=False
+            )
+        ]
+
+        risk = RiskAssessment(
+            risk_level="中",
+            risk_score=50,
+            category="其他",
+            key_factors=[]
+        )
+
+        debunk_info = DebunkInfo(
+            exists=True,
+            debunk_url="https://example.com/debunk",
+            debunk_authority="央视新闻",
+            coverage_ratio=0.35
+        )
+        duplicate_count = 2
+
+        tips = analyzer._generate_actionable_tips(channels, risk, debunk_info, duplicate_count)
+
+        tip_types = [t.tip_type for t in tips]
+        assert "duplicate_content" not in tip_types
+        assert "regional_spike" not in tip_types
+        assert "high_risk" not in tip_types
+        assert "debunk_coverage" in tip_types
+
+        debunk_tip = [t for t in tips if t.tip_type == "debunk_coverage"][0]
+        assert "35%" in debunk_tip.content
+        assert "央视新闻" in debunk_tip.content
+
+    def test_calculate_duplicate_count(self, db_session):
+        analyzer = RumorAnalyzer(db_session)
+
+        from schemas import DiffusionChannel
+
+        channels_small = [
+            DiffusionChannel(
+                channel_name="社交媒体群组",
+                share_count=50,
+                growth_rate=0.1,
+                region=None,
+                is_rapid_growth=False
+            )
+        ]
+        count_small = analyzer._calculate_duplicate_account_count(None, channels_small)
+        assert count_small >= 1
+
+        channels_large = [
+            DiffusionChannel(
+                channel_name="社交媒体群组",
+                share_count=8000,
+                growth_rate=2.0,
+                region="北京",
+                is_rapid_growth=True
+            ),
+            DiffusionChannel(
+                channel_name="短视频平台",
+                share_count=6000,
+                growth_rate=1.8,
+                region=None,
+                is_rapid_growth=True
+            )
+        ]
+        count_large = analyzer._calculate_duplicate_account_count(None, channels_large)
+        assert count_large >= 10
+        assert count_large > count_small
+
+    def test_duplicate_count_matches_accounts(self, db_session):
+        analyzer = RumorAnalyzer(db_session)
+
+        text = "测试文案内容"
+        result, case = analyzer.analyze(text, ["标签1"], None)
+
+        tip_types = [t.tip_type for t in result.actionable_tips]
+        if "duplicate_content" in tip_types:
+            dup_tip = [t for t in result.actionable_tips if t.tip_type == "duplicate_content"][0]
+            import re
+            match = re.search(r'(\d+)\s*个账号', dup_tip.content)
+            if match:
+                tip_count = int(match.group(1))
+                db_count = len(case.duplicate_accounts)
+                assert tip_count == db_count
 
     def test_check_debunk_info(self, db_session):
         analyzer = RumorAnalyzer(db_session)

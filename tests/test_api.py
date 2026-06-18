@@ -271,3 +271,164 @@ class TestSupervisorAPI:
         assert data["rumor_id"] == rumor_id
         assert "total_accounts" in data
         assert len(data["accounts"]) >= 3
+
+    def test_daily_high_risk_grouped(self, client):
+        categories = ["医疗健康", "公共安全", "民生政策", "财经金融"]
+        for i, cat in enumerate(categories):
+            for j in range(i + 1):
+                keyword = {
+                    "医疗健康": "病毒疫情",
+                    "公共安全": "火灾事故",
+                    "民生政策": "退休补贴",
+                    "财经金融": "股票暴跌"
+                }[cat]
+                payload = {
+                    "text_content": f"测试{i}-{j} {keyword}",
+                    "ticket_id": f"TICKET-GROUP-{i}-{j}",
+                    "submitter": "auditor_01"
+                }
+                client.post("/api/v1/audit/analyze", json=payload)
+
+        response = client.get("/api/v1/supervisor/daily-high-risk/grouped?min_risk_score=0")
+        assert response.status_code == 200
+        data = response.json()
+
+        assert "groups" in data
+        assert len(data["groups"]) >= 1
+        assert "total_high_risk" in data
+        assert "by_category" in data
+
+        for group in data["groups"]:
+            assert "category" in group
+            assert "count" in group
+            assert "rumors" in group
+            assert group["count"] == len(group["rumors"])
+            for rumor in group["rumors"]:
+                assert rumor["category"] == group["category"]
+
+    def test_daily_high_risk_grouped_sorted(self, client):
+        for i in range(5):
+            payload = {
+                "text_content": f"分组排序测试{i} 病毒疫情",
+                "ticket_id": f"TICKET-GRPSORT-{i}",
+                "submitter": "auditor_01"
+            }
+            client.post("/api/v1/audit/analyze", json=payload)
+
+        response = client.get("/api/v1/supervisor/daily-high-risk/grouped?item_sort_by=total_shares&sort_order=desc&min_risk_score=0")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["sort_by"] == "total_shares"
+
+    def test_spread_track_with_intervention_stats(self, client):
+        payload = {
+            "text_content": "传播统计测试 病毒疫情",
+            "ticket_id": "TICKET-STATS-001",
+            "submitter": "auditor_01"
+        }
+        client.post("/api/v1/audit/analyze", json=payload)
+
+        rumors_response = client.get("/api/v1/supervisor/rumors?limit=1")
+        rumor_id = rumors_response.json()[0]["rumor_id"]
+
+        response = client.get(f"/api/v1/supervisor/rumors/{rumor_id}/spread-track")
+        assert response.status_code == 200
+        data = response.json()
+
+        assert "observation_status" in data
+        assert "intervention_stats" in data
+
+        client.post(f"/api/v1/supervisor/rumors/{rumor_id}/intervene")
+
+        response2 = client.get(f"/api/v1/supervisor/rumors/{rumor_id}/spread-track")
+        assert response2.status_code == 200
+        data2 = response2.json()
+
+        assert data2["intervention_time"] is not None
+        assert "intervention_stats" in data2
+        assert "observation_status" in data2
+        assert data2["observation_status"] in ["待观察", "处置后暂无数据"]
+
+    def test_export_json(self, client):
+        for i in range(3):
+            payload = {
+                "text_content": f"导出测试{i} 病毒疫情",
+                "ticket_id": f"TICKET-EXPORT-{i}",
+                "submitter": "auditor_01"
+            }
+            client.post("/api/v1/audit/analyze", json=payload)
+
+        response = client.get("/api/v1/supervisor/daily-high-risk/export?format=json&min_risk_score=0")
+        assert response.status_code == 200
+        data = response.json()
+
+        assert "export_date" in data
+        assert "total_high_risk" in data
+        assert "export_time" in data
+        assert "groups" in data
+        assert "by_category_count" in data
+
+        for group in data["groups"]:
+            assert "category" in group
+            assert "rumors" in group
+            for rumor in group["rumors"]:
+                assert "risk_level" in rumor
+                assert "risk_score" in rumor
+                assert "total_shares" in rumor
+                assert "main_channels" in rumor
+                assert "handle_status" in rumor
+                assert "debunk_status" in rumor
+
+    def test_export_csv(self, client):
+        for i in range(3):
+            payload = {
+                "text_content": f"CSV导出测试{i} 病毒疫情",
+                "ticket_id": f"TICKET-CSV-{i}",
+                "submitter": "auditor_01"
+            }
+            client.post("/api/v1/audit/analyze", json=payload)
+
+        response = client.get("/api/v1/supervisor/daily-high-risk/export?format=csv&min_risk_score=0")
+        assert response.status_code == 200
+        assert "text/csv" in response.headers.get("content-type", "")
+        assert "attachment" in response.headers.get("content-disposition", "")
+
+        content = response.text
+        assert "序号" in content
+        assert "类别" in content
+        assert "标题" in content
+        assert "风险等级" in content
+        assert "总传播量" in content
+        assert "处置状态" in content
+
+    def test_tips_correspond_with_data(self, client):
+        payload = {
+            "text_content": "提示一致性测试",
+            "topic_tags": ["疫情", "病毒"],
+            "ticket_id": "TICKET-TIP-CONSIST-001",
+            "submitter": "auditor_01"
+        }
+
+        response = client.post("/api/v1/audit/analyze", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        result = data["result"]
+
+        channels = result["main_channels"]
+        tips = result["actionable_tips"]
+        debunk_info = result["debunk_info"]
+
+        regional_tips = [t for t in tips if t["tip_type"] == "regional_spike"]
+        rapid_with_region = [c for c in channels if c["is_rapid_growth"] and c["region"]]
+
+        if rapid_with_region:
+            assert len(regional_tips) >= 1
+            rc = rapid_with_region[0]
+            assert rc["region"] in regional_tips[0]["content"]
+
+        debunk_tips = [t for t in tips if t["tip_type"] == "debunk_coverage"]
+        if debunk_info["exists"]:
+            assert len(debunk_tips) >= 1
+            assert debunk_info["debunk_authority"] in debunk_tips[0]["content"]
+        else:
+            assert len(debunk_tips) == 0
